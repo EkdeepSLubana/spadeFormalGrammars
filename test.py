@@ -1,14 +1,15 @@
 import sys
 # sys.path.append("./dictionary_learning/")
 # sys.path.append("./spadeFormalGrammars/")
+sys.path.append("../dictionary_learning/")
 
 from collections import namedtuple
-# from dictionary_learning import AutoEncoder, JumpReluAutoEncoder
+from dictionary_learning import AutoEncoder, JumpReluAutoEncoder
 from sae import SAE, step_fn
 from utils.loading import load_sae_inference_only
 
 # RelaxedArchetypalAutoEncoder
-# from dictionary_learning.dictionary import IdentityDict
+from dictionary_learning.dictionary import IdentityDict
 from dataset import Submodule, Dataset
 from typing import Literal
 from nnsight import LanguageModel
@@ -37,6 +38,7 @@ def _load_pythia_saes_and_submodules(
     separate_by_type: bool = False,
     include_embed: bool = True,
     neurons: bool = False,
+    null: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device = t.device("cpu"),
 ):
@@ -53,14 +55,16 @@ def _load_pythia_saes_and_submodules(
             name = "embed",
             submodule=model.gpt_neox.embed_in,
         )
-        if not neurons:
+        if not neurons and not null:
             dictionaries[embed] = AutoEncoder.from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/embed/10_32768/ae.pt",
                 dtype=dtype,
                 device=device,
             )
-        else:
+        elif neurons:
             dictionaries[embed] = IdentityDict(512)
+        else:
+            dictionaries[embed] = None
     else:
         embed = None
     for i, layer in enumerate(model.gpt_neox.layers[:thru_layer+1]):
@@ -84,7 +88,7 @@ def _load_pythia_saes_and_submodules(
                 is_tuple=True,
             )
         )
-        if not neurons:
+        if not neurons and not null:
             dictionaries[attn] = AutoEncoder.from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/attn_out_layer{i}/10_32768/ae.pt",
                 dtype=dtype,
@@ -100,10 +104,14 @@ def _load_pythia_saes_and_submodules(
                 dtype=dtype,
                 device=device,
             )
-        else:
+        elif neurons:
             dictionaries[attn] = IdentityDict(512)
             dictionaries[mlp] = IdentityDict(512)
             dictionaries[resid] = IdentityDict(512)
+        else:
+            dictionaries[attn] = None
+            dictionaries[mlp] = None
+            dictionaries[resid] = None
 
     if separate_by_type:
         return DictionaryStash(embed, attns, mlps, resids), dictionaries
@@ -121,6 +129,7 @@ def load_gemma_sae(
     layer: int,
     width: Literal["16k", "65k"] = "16k",
     neurons: bool = False,
+    null: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device = t.device("cpu"),
 ):
@@ -162,6 +171,7 @@ def _load_gemma_saes_and_submodules(
     separate_by_type: bool = False,
     include_embed: bool = True,
     neurons: bool = False,
+    null: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device = t.device("cpu"),
 ):
@@ -175,10 +185,15 @@ def _load_gemma_saes_and_submodules(
     dictionaries = {}
     if include_embed:
         embed = Submodule(
-            name = "embed",
-            submodule=model.model.embed_tokens,
+                name = "embed",
+                submodule=model.model.embed_tokens,
         )
-        dictionaries[embed] = load_gemma_sae("embed", 0, neurons=neurons, dtype=dtype, device=device)
+        if not neurons and not null:
+            dictionaries[embed] = load_gemma_sae("embed", 0, neurons=neurons, dtype=dtype, device=device)
+        elif neurons:
+            dictionaries[embed] = IdentityDict(2304)
+        else:
+            dictionaries[embed] = None
     else:
         embed = None
     for i, layer in tqdm(enumerate(model.model.layers[:thru_layer+1]), total=thru_layer+1, desc="Loading Gemma SAEs"):
@@ -189,14 +204,12 @@ def _load_gemma_saes_and_submodules(
                 use_input=True
             )
         )
-        dictionaries[attn] = load_gemma_sae("attn", i, neurons=neurons, dtype=dtype, device=device)
         mlps.append(
             mlp := Submodule(
                 name=f"mlp_{i}",
                 submodule=layer.post_feedforward_layernorm,
             )
         )
-        dictionaries[mlp] = load_gemma_sae("mlp", i, neurons=neurons, dtype=dtype, device=device)
         resids.append(
             resid := Submodule(
                 name=f"resid_{i}",
@@ -204,7 +217,20 @@ def _load_gemma_saes_and_submodules(
                 is_tuple=True,
             )
         )
-        dictionaries[resid] = load_gemma_sae("resid", i, neurons=neurons, dtype=dtype, device=device)
+        if not neurons and not null:
+            dictionaries[resid] = load_gemma_sae("resid", i, neurons=neurons, dtype=dtype, device=device)
+            # dictionaries[attn] = load_gemma_sae("attn", i, neurons=neurons, dtype=dtype, device=device)
+            # dictionaries[mlp] = load_gemma_sae("mlp", i, neurons=neurons, dtype=dtype, device=device)
+            dictionaries[attn] = None
+            dictionaries[mlp] = None
+        elif neurons:
+            dictionaries[mlp] = IdentityDict(2304)
+            dictionaries[attn] = IdentityDict(2304)
+            dictionaries[resid] = IdentityDict(2304)
+        else:
+            dictionaries[mlp] = None
+            dictionaries[attn] = None
+            dictionaries[resid] = None
 
     if separate_by_type:
         return DictionaryStash(embed, attns, mlps, resids), dictionaries
@@ -223,15 +249,16 @@ def load_saes_and_submodules(
     separate_by_type: bool = False,
     include_embed: bool = True,
     neurons: bool = False,
+    null: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device = t.device("cpu"),
 ):
     model_name = model.config._name_or_path
 
     if model_name == "EleutherAI/pythia-70m-deduped":
-        return _load_pythia_saes_and_submodules(model, thru_layer=thru_layer, separate_by_type=separate_by_type, include_embed=include_embed, neurons=neurons, dtype=dtype, device=device)
+        return _load_pythia_saes_and_submodules(model, thru_layer=thru_layer, separate_by_type=separate_by_type, include_embed=include_embed, neurons=neurons, null=null, dtype=dtype, device=device)
     elif model_name == "google/gemma-2-2b":
-        return _load_gemma_saes_and_submodules(model, thru_layer=thru_layer, separate_by_type=separate_by_type, include_embed=include_embed, neurons=neurons, dtype=dtype, device=device)
+        return _load_gemma_saes_and_submodules(model, thru_layer=thru_layer, separate_by_type=separate_by_type, include_embed=include_embed, neurons=neurons, null=null, dtype=dtype, device=device)
     else:
         raise ValueError(f"Model {model_name} not supported")
 
@@ -243,14 +270,19 @@ def get_mid_layer(submodules, layer):
             return submodule
 
 
-def get_activations(model, submodule, dictionary, batch, args):
+def get_activations(model, submodule, dictionary, batch, sae_path, identity=False):
     with t.no_grad(), model.trace(batch):
         x = submodule.get_activation()
         x_saved = x.save()
     x_saved = x_saved.value
-    if "sparsemax_dist" in args.sae:
+    if "sparsemax_dist" in sae_path or "MP" in sae_path:
         x_saved = x_saved[0]
-    x_hat, f = dictionary(x_saved, return_hidden=True)
+    if not identity:
+        # x_hat, f = dictionary(x_saved, return_hidden=True)
+        x_hat, f = dictionary(x_saved, output_features=True)
+    else:
+        f = dictionary(x_saved)
+        x_hat = f
     # f_saved = f.save()
     return (f.detach(), x_hat.detach())
 
@@ -366,12 +398,14 @@ def reconstruct_means(acts, labels, target_label1="domain-science", target_label
         acts12 = np.add(acts12, acts[idx12])
     acts12 /= len(label12_present)
 
-    A = np.column_stack([acts1, acts2])
-    coeffs, residuals, rank, singular_values = np.linalg.lstsq(A, acts12, rcond=None)
-    
-    alpha, beta = coeffs
-    reconstruction = alpha * acts1 + beta * acts2
-    resid_vec = acts12 - reconstruction
+    proj_acts1 = (np.dot(acts12, acts1) / np.dot(acts1, acts1)) * acts1
+    proj_acts2 = (np.dot(acts12, acts2) / np.dot(acts2, acts2)) * acts2
+    print(proj_acts1)
+    print(proj_acts2)
+    acts12_reconstructed = proj_acts1 + proj_acts2
+
+    # Analysis
+    resid_vec = acts12 - acts12_reconstructed
 
     mse = np.square(resid_vec).mean()
     acts12_norm = np.linalg.norm(acts12)
@@ -381,13 +415,25 @@ def reconstruct_means(acts, labels, target_label1="domain-science", target_label
     ss_res = np.square(resid_vec).sum()
     r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
 
-    return {"coefficients": (alpha, beta),
-            "reconstruction": reconstruction,
-            "residual_vector": resid_vec,
+    proj_v1_magnitude = np.linalg.norm(proj_acts1)
+    proj_v2_magnitude = np.linalg.norm(proj_acts2)
+    original_magnitude = np.linalg.norm(acts12)
+    reconstructed_magnitude = np.linalg.norm(acts12_reconstructed)
+    fraction_in_v1_direction = proj_v1_magnitude / original_magnitude
+    fraction_in_v2_direction = proj_v2_magnitude / original_magnitude
+
+    cos_sim = np.dot(acts1, acts2) / (np.linalg.norm(acts1) * np.linalg.norm(acts2))
+
+    return {"proj_v1": proj_acts1,
+            "proj_v2": proj_acts2,
+            "reconstruction": acts12_reconstructed,
             "MSE": mse,
             "relative_error": relative_error,
             "r_squared": r_squared,
-            "rank": rank}
+            "cos_sim": cos_sim,
+            "fraction_in_v1": fraction_in_v1_direction,
+            "fraction_in_v2": fraction_in_v2_direction
+            }
 
 
 def plot_distributions(activations, top_features, labels, bins=30, model_name="pythia70m", lamda=0.1):
@@ -466,27 +512,30 @@ if __name__ == "__main__":
     
     submodule = Submodule(
         name = f"resid_{mid_layer}",
-        submodule=model.gpt_neox.layers[mid_layer],
+        # submodule=model.gpt_neox.layers[mid_layer],
+        submodule = model.model.layers[mid_layer],
         is_tuple=True,
     )
-    # submodules, dictionaries = load_saes_and_submodules(model, dtype=dtype, device=device, thru_layer=mid_layer, neurons=neurons)
-    # submodule = get_mid_layer(submodules, mid_layer)
+    submodules, dictionaries = load_saes_and_submodules(model, dtype=dtype, device=device, thru_layer=mid_layer, neurons=neurons)
+    submodule = get_mid_layer(submodules, mid_layer)
+
     # Load for inference only
-    dictionary, _, _ = load_sae_inference_only(args.sae, dimin=model.config.hidden_size)
-    dictionary.to("cuda:0")
+    # dictionary, _, _ = load_sae_inference_only(args.sae, dimin=model.config.hidden_size)
+    # dictionary.to("cuda:0")
+    # dictionary.requires_grad_(False)
+
     # Archetypal SAEs
     # dictionaries[submodule] = AutoEncoder.from_pretrained(
     #         "/home/aaron/fromgit/identifiable_language/archetypal/dictionary_learning/weights/pythia-70m/reg/trainer_0/ae.pt",
     #         device=device
     # )
     if args.randomize_sae:
-        dictionary.encoder.reset_parameters()
-        dictionary.decoder.reset_parameters()
+        dictionary._reset_parameters()
         # dictionaries[submodule].W_enc.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].W_dec.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].b_enc.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].b_dec.data.normal_(mean=0, std=0.1)
-    # dictionary = dictionaries[submodule]
+    dictionary = dictionaries[submodule]
 
 
     dataset = load_dataset(args.dataset)
@@ -506,10 +555,16 @@ if __name__ == "__main__":
         for batch in range(n_batches)
     ]
 
-    with t.no_grad(), model.trace("test"):
+    with t.no_grad(), model.trace("t"):
         x = submodule.get_activation()
         x_saved = x.save()
-    x_hat, f = dictionary(x_saved.value, return_hidden=True)
+    if not args.identity_baseline:
+        # x_hat, f = dictionary(x_saved.value[:, 0, :], return_hidden=True)
+        x_hat, f = dictionary(x_saved.value[:, 0, :], output_features=True)
+    else:
+        f = dictionary(x_saved.value[:, 0, :])
+        x_hat = f
+
     num_hidden = f.detach().shape[-1]
     num_hidden_xhat = x_hat.detach().shape[-1]
     # f_saved = f.save()
@@ -518,8 +573,8 @@ if __name__ == "__main__":
     acts_xhat = t.zeros((num_examples, num_hidden_xhat))
 
     for idx, batch in tqdm(enumerate(batches), desc="Caching activations", total=len(batches)):
-        f, xhat = get_activations(model, submodule, dictionary, batch, args)
-        if "sparsemax_dist" in args.sae:
+        f, xhat = get_activations(model, submodule, dictionary, batch, args.sae, identity=args.identity_baseline)
+        if "sparsemax_dist" in args.sae or "MP" in args.sae:
             f = f.unsqueeze(0)
             xhat = xhat.unsqueeze(0)
         f = f.sum(dim=1)
@@ -528,6 +583,12 @@ if __name__ == "__main__":
         start_idx = idx * batch_size
         acts[start_idx : start_idx + len_batch] = f
         acts_xhat[start_idx : start_idx + len_batch] = xhat
+    
+    if args.randomize_sae:
+        acts_input = t.rand(acts.shape)
+        acts = t.rand(acts.shape)
+        acts_hat = t.rand(acts_xhat.shape)
+
 
     scores, top_features = score_identification(acts, dataset.labels_binary, 
                                                 lamda=args.lamda, metric=args.id_metric)
@@ -542,7 +603,7 @@ if __name__ == "__main__":
             print(f"{label}: {top_scores[i]} ({top_features[label]})")
         # for i, label in enumerate(list(top_features.keys())):
         #     print(f"{label}: {top_scores[i]} ({top_features[label]})")
-        print(f"MCC: {mcc:.3f}") 
+        print(f"MCC: {mcc:.3f}")
     else:
         print(scores)
         print(sum(list(scores.values())))
@@ -550,18 +611,12 @@ if __name__ == "__main__":
         print()
         print(top_features)
 
-    print()
-    rec_metrics = reconstruct_means(acts, dataset.labels_binary)
-    print("Feature reconstruction:")
-    print("\tRelative error:", rec_metrics["relative_error"])
-    print("\tR^2:", rec_metrics["r_squared"])
-    print("\tCoefficients:", rec_metrics["coefficients"])
-
-    rec_metrics = reconstruct_means(acts_xhat, dataset.labels_binary)
-    print("Decoded activation reconstruction:")
-    print("\tRelative error:", rec_metrics["relative_error"])
-    print("\tR^2:", rec_metrics["r_squared"])
-    print("\tCoefficients:", rec_metrics["coefficients"])
+    # print()
+    # rec_metrics = reconstruct_means(acts, dataset.labels_binary)
+    # print("Decoded activation reconstruction:")
+    # print(rec_metrics)
+    # print("\tRelative error:", rec_metrics["relative_error"])
+    # print("\tR^2:", rec_metrics["r_squared"])
 
     # sensitivities = {}
     # for label in tqdm(dataset.labels_binary, total=len(list(dataset.labels_binary.keys())), desc="Sensitivity of label"):

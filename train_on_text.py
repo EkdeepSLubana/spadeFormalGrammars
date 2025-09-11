@@ -161,7 +161,8 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
         return hook
 
     # Attach hook to get activations
-    act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
+    # act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
+    act_hook = base_model.model.layers[mid_layer].register_forward_hook(getActivation())
 
     # Activation scaling
     # TODO: Change according to precise model / data <scaling_factor> should 
@@ -268,7 +269,7 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
                 loss_reg = torch.tensor([0.0], device=device)
 
             # MP: L0 loss
-            elif 'MP' in sae.module.sae_type:
+            elif 'MP' in sae.sae_type:
                 loss_reg = torch.tensor([0.0], device=device)
 
             else:
@@ -294,13 +295,13 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
             if normalize_weights:
                 with torch.no_grad():
                     # Normalize encoder weights
-                    sae.module.Ae.data /= (sae.module.eps + torch.linalg.norm(sae.module.Ae.data, dim=1, keepdim=True)) 
-                    sae.module.Ae.data *= base_model.config.hidden_size ** 0.5
+                    sae.Ae.data /= (sae.eps + torch.linalg.norm(sae.Ae.data, dim=1, keepdim=True)) 
+                    sae.Ae.data *= base_model.config.hidden_size ** 0.5
                     
                     # Normalize decoder weights (MP doesn't have an explicit decoder)
-                    if not 'MP' in sae.module.sae_type:
-                        sae.module.Ad.data /= (sae.module.eps + torch.linalg.norm(sae.module.Ad.data, dim=0, keepdim=True))
-                        sae.module.Ad.data *= base_model.config.hidden_size ** 0.5
+                    if not 'MP' in sae.sae_type:
+                        sae.Ad.data /= (sae.eps + torch.linalg.norm(sae.Ad.data, dim=0, keepdim=True))
+                        sae.Ad.data *= base_model.config.hidden_size ** 0.5
 
             ## Logging
             train_log['total'].append(loss.item()) # Total loss

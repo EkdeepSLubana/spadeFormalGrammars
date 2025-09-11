@@ -3,6 +3,7 @@ from sparsemax import Sparsemax
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+import torch.nn.init as init
 
 class SAE(torch.nn.Module):
     def __init__(self, dimin=2, width=5, sae_type='relu', kval_topk=None, mp_kval=None,
@@ -23,6 +24,7 @@ class SAE(torch.nn.Module):
         self.sae_type = sae_type
         self.width = width
         self.dimin = dimin
+        self.eps = 0.01
         self.normalize_weights = normalize_weights
 
         ## Encoder parameters
@@ -175,7 +177,37 @@ class SAE(torch.nn.Module):
             return x
         else:
             return x, codes
+        
+        
+    def decode(self, codes):
+        if self.sae_type == 'relu':
+            x = torch.matmul(codes, self.Ad.T) + self.bd
+        elif self.sae_type == 'topk':
+            x = torch.matmul(codes, self.Ad.T) + self.bd
+        elif self.sae_type == 'MP':
+            x = torch.matmul(codes, self.Ae) + self.bd
+        elif self.sae_type == 'jumprelu':
+            x = torch.matmul(codes, self.Ad.T) + self.bd
+        elif self.sae_type == 'sparsemax_dist':
+            x = torch.matmul(codes, self.Ad.T)
+        
+        return x
 
+    def _reset_parameters(self):
+        """
+        Default method for initializing GatedSAE weights.
+        """
+        # biases are initialized to zero
+        init.zeros_(self.Ae)
+        init.zeros_(self.Ad)
+        init.zeros_(self.be)
+        init.zeros_(self.bd)
+
+        # decoder weights are initialized to random unit vectors
+        # dec_weight = torch.randn_like(self.Ad.weight)
+        # dec_weight = dec_weight / dec_weight.norm(dim=0, keepdim=True)
+        # self.Ad.weight = nn.Parameter(dec_weight)
+        # self.Ae.weight = nn.Parameter(dec_weight.clone().T)
 
 
 ######################## UTILS ########################

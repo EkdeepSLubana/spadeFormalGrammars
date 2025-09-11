@@ -66,11 +66,11 @@ def load_sae_inference_only(checkpoint_path, device='cpu', dimin=None):
     # Reconstruct SAE model from config
     sae = SAE(
         dimin=dimin,
-        width=dimin*config.sae.exp_factor,
+        width=int(dimin*config.sae.exp_factor), 
         sae_type=config.sae.sae_type,
         kval_topk=config.sae.kval_topk if config.sae.sae_type=='topk' else None,
-        normalize_decoder=(not config.sae.sae_type == 'sparsemax_dist'),
-        lambda_init=getattr(config, 'lambda_init', None)
+        mp_kval=config.sae.mp_kval if config.sae.sae_type=='MP' else None,
+        normalize_weights=True,
     )
     
     # Load state dict
