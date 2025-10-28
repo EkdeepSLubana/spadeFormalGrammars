@@ -54,7 +54,7 @@ def open_log(cfg):
     print(cfg)
     os.makedirs('logs/' + cfg.tag, exist_ok=True)
     if cfg.deploy:
-        fname = 'logs/' + cfg.tag + '/' + wandb.run.id + ".log"
+        fname = 'logs/' + cfg.tag + '/' + "log"+ ".log"
         fout = open(fname, "a", 1)
         sys.stdout = fout
         sys.stderr = fout
@@ -66,7 +66,7 @@ def save_config(cfg):
     """
     Save configuration to file
     """
-    results_dir = 'results/' + cfg.tag + "/" + wandb.run.id
+    results_dir = 'results/' + cfg.tag + "/" + ""
     os.makedirs(results_dir, exist_ok=True)
     with open(results_dir + '/conf.yaml', 'w') as f:
         yaml.dump(OmegaConf.to_container(cfg), f)
@@ -143,22 +143,34 @@ def log_sae_train(it, deploy, lr, train_log):
     """
     Log training information
     """
-    if deploy and len(train_log['total']) > 0:
-        wandb.log({
-            "total loss": np.mean(train_log['total']),
-            "MSE": np.mean(train_log['mse']),
-            "Reg.": np.mean(train_log['reg']),
-            "% Sparsity": np.mean(train_log['p_sparsity']),
-            "Lambda": np.mean(train_log['lambda']),
-            "iteration": it,
-            "lr": lr
-            })
+    # if deploy and len(train_log['total']) > 0:
+        # wandb.log({
+        #     "total loss": np.mean(train_log['total']),
+        #     "MSE": np.mean(train_log['mse']),
+        #     "Reg.": np.mean(train_log['reg']),
+        #     "% Sparsity": np.mean(train_log['p_sparsity']),
+        #     "Lambda": np.mean(train_log['lambda']),
+        #     "iteration": it,
+        #     "lr": lr
+        #     })
+    train_log = {
+        "total loss": np.mean(train_log['total']),
+        "MSE": np.mean(train_log['mse']),
+        "Reg.": np.mean(train_log['reg']),
+        "% Sparsity": np.mean(train_log['p_sparsity']),
+        "Lambda": np.mean(train_log['lambda']),
+        "iteration": it,
+        "lr": lr
+    }
+    print(train_log)
 
-    print("train -- iter: %d, lr: %.6f, loss: %.4f" % (it, lr, np.mean(train_log['total'])))
+    # print("train -- iter: %d, lr: %.6f, loss: %.4f" % (it, lr, np.mean(train_log['total'])))
     train_log = {
         'total': [],
         'mse': [],
+        'nmse': [],
         'reg': [],
+        'variance_explained': [],
         'p_sparsity': [],
         'lambda': []
     }
@@ -200,7 +212,7 @@ def save_sae(cfg, sae, optimizer, it):
             'iter': it,
             'config': cfg,
         }
-        fdir = 'sae_results/' + cfg.tag + "/"
+        fdir = f'sae_results/{cfg.seed}/{cfg.tag}/'
         os.makedirs(fdir, exist_ok=True)
         if cfg.log.save_multiple:
             fname = os.path.join(fdir, 'ckpt_' + str(it+1) + '.pt')

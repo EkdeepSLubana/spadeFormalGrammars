@@ -11,4 +11,4 @@ mamba activate identifiable
 
 cd /projectnb/buinlp/amueller/identifiable_language/spadeFormalGrammars/
 
-python train_on_text.py -c $1
+python train_on_text.py --config-name $1

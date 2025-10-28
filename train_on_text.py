@@ -5,27 +5,28 @@ import torch.nn.functional as F
 import os
 import numpy as np
 import pickle as pkl
-import argparse
-import sys
-from box import Box
 
 from model import GPT
 from dgp import get_dataloader, get_dataloader_json
-from sae import SAE, step_fn
+from sae_test import SAE, step_fn
 
-from utils import set_seed, save_config, open_log, cleanup
+from utils import init_wandb, cleanup
+from utils import set_seed, save_config, open_log
 from utils import update_cosine_warmup_lr
 from utils import save_sae, move_to_device, log_sae_train
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-# @hydra.main(config_path="./config/sae_train", config_name="conf.yaml", version_base="1.3")
+# @hydra.main(config_path="./config/sae_train", config_name="conf_gemma-2-2b_MP.yaml", version_base="1.3")
+@hydra.main(config_path="./config/sae_train", config_name="conf_gemma-2-2b_spade.yaml", version_base="1.3")
 def main_hf(sae_cfg):
-    # init_wandb(sae_cfg, project_name="pcfg_saes_training")
-    print(sae_cfg)
+    # Setup Environment
     set_seed(sae_cfg.seed)
-    # save_config(sae_cfg)
+    # init_wandb(sae_cfg, project_name=sae_cfg.log.wandb_project_name)
+    save_config(sae_cfg)
     # fp = open_log(sae_cfg)
+
+    print(sae_cfg)
     device = sae_cfg.device if torch.cuda.is_available() else 'cpu'
 
     base_model_name = sae_cfg.model_name
@@ -50,8 +51,19 @@ def main_hf(sae_cfg):
         model_name=sae_cfg.model_name
     )
 
+    dev_dataloader = get_dataloader_json(
+        path=sae_cfg.data.dev_path,
+        corr_config=sae_cfg.data.corr_config,
+        num_iters=sae_cfg.data.num_iters * sae_cfg.data.batch_size,
+        max_sample_length=sae_cfg.data.max_sample_length,
+        seed=sae_cfg.seed,
+        batch_size=sae_cfg.data.batch_size // 2,
+        num_workers=sae_cfg.data.num_workers,
+        model_name=sae_cfg.model_name
+    )
+    
+
     # Define SAE
-    normalize_weights = True #(not sae_cfg.sae.sae_type == 'sparsemax_dist' and not 'MP' in sae_cfg.sae.sae_type)
     dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
@@ -59,7 +71,6 @@ def main_hf(sae_cfg):
         sae_type=sae_cfg.sae.sae_type,
         kval_topk=sae_cfg.sae.kval_topk if sae_cfg.sae.sae_type=='topk' else None,
         mp_kval=sae_cfg.sae.mp_kval if sae_cfg.sae.sae_type=='MP' else None,
-        normalize_weights=normalize_weights,
     )
     sae.to(device)
     # print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
@@ -70,8 +81,7 @@ def main_hf(sae_cfg):
         weight_decay=sae_cfg.optimizer.weight_decay)
 
     # Train
-    train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, 
-          encoder_reg=sae_cfg.sae.encoder_reg, normalize_weights=normalize_weights)
+    train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg, dev_dataloader=dev_dataloader)
 
     # Close wandb and log file
     # cleanup(sae_cfg, fp)
@@ -98,6 +108,7 @@ def main(sae_cfg):
     base_model.to(device)
     print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
 
+
     # Define dataloader
     dataloader = get_dataloader(
         language=base_model_cfg.data.language,
@@ -112,7 +123,6 @@ def main(sae_cfg):
     )
 
     # Define SAE
-    normalize_weights = True #(not sae_cfg.sae.sae_type == 'sparsemax_dist' and not 'MP' in sae_cfg.sae.sae_type)
     dimin = base_model.config.hidden_size
     sae = SAE(
         dimin=dimin,
@@ -120,7 +130,6 @@ def main(sae_cfg):
         sae_type=sae_cfg.sae.sae_type,
         kval_topk=sae_cfg.sae.kval_topk if sae_cfg.sae.sae_type=='topk' else None,
         mp_kval=sae_cfg.sae.mp_kval if sae_cfg.sae.sae_type=='MP' else None,
-        normalize_weights=normalize_weights,
     )
     sae.to(device)
     print("number of parameters: %.2fM" % (base_model.get_num_params()/1e6,))
@@ -131,15 +140,13 @@ def main(sae_cfg):
         weight_decay=sae_cfg.optimizer.weight_decay)
 
     # Train
-    train(sae_cfg, sae, base_model, dataloader, optimizer, device,
-          encoder_reg=sae_cfg.sae.encoder_reg, normalize_weights=normalize_weights)
+    train(sae_cfg, sae, base_model, dataloader, optimizer, device, encoder_reg=sae_cfg.sae.encoder_reg)
 
     # Close wandb and log file
     # cleanup(sae_cfg, fp)
 
 
-def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, 
-          encoder_reg=True, normalize_weights=False):
+def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, device, encoder_reg=True, dev_dataloader=None):
     """
     Training function
     """
@@ -161,13 +168,12 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
         return hook
 
     # Attach hook to get activations
-    # act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
-    act_hook = base_model.model.layers[mid_layer].register_forward_hook(getActivation())
+    act_hook = base_model.gpt_neox.layers[mid_layer].register_forward_hook(getActivation())
+    # act_hook = base_model.model.layers[mid_layer].register_forward_hook(getActivation())
 
-    # Activation scaling
-    # TODO: Change according to precise model / data <scaling_factor> should 
-    # ensure E[||x||_2] = \sqrt{D}, where D is dimension of the representation
-    acts_scaling = 1 / 16.9063
+    # Activation scaling (ensure E[||x||_2] = 1)
+    # acts_scaling = 1 / 236.184564 
+    acts_scaling = 1 / 64
 
     # Data type (bf16 for efficiency)
     dt = torch.bfloat16 if sae_cfg.bf16 else torch.float32
@@ -177,11 +183,18 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
 
     # Initialize SAE training log
     train_log = {
-        'total': [],
-        'mse': [],
-        'reg': [],
-        'p_sparsity': [],
-        'lambda': []
+        "total": [],
+        "mse": [],
+        "nmse": [],
+        "reg": [],
+        "variance_explained": [],
+        "p_sparsity": [],
+        "lambda": []
+    }
+    val_log = {
+        "mse": [],
+        "nmse": [],
+        "variance_explained": []
     }
 
     # Some hparams variables
@@ -197,123 +210,127 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
     save_sae(sae_cfg, sae, optimizer, it)
 
     # Training loop
-    for sequences, _, _ in dataloader:
-        # if it > 1e5: # Training destabilizes after a certain point when the loss is too low, so we break
-        #     save_sae(sae_cfg, sae, optimizer, it)
-        #     break
+    for epoch in range(sae_cfg.epochs):
+        for sequences, _, _ in dataloader:
+            if it > 7000 and sae_cfg.sae.sae_type == 'sparsemax_dist': 
+                print("Training destabilizes after a certain point when the loss is too low, so we break")
+                save_sae(sae_cfg, sae, optimizer, it)
+                break
 
-        # Log train metrics
-        if it % sae_cfg.log.log_interval == 0 and it != 0:
-            results = {
-                "total loss": np.mean(train_log['total']),
-                "MSE": np.mean(train_log['mse']),
-                "Reg.": np.mean(train_log['reg']),
-                "% Sparsity": np.mean(train_log['p_sparsity']),
-                "Lambda": np.mean(train_log['lambda']),
-                "iteration": it,
-                "lr": lr
-            }
-            print(results)
-            # train_log = log_sae_train(it, sae_cfg.deploy, lr, train_log)
+            # Update LR
+            it, lr = update_cosine_warmup_lr(it, sae_cfg.optimizer, optimizer, total_steps)
 
+            # Get activations from input data
+            inputs = move_to_device([sequences], device)
 
-        # Update LR
-        it, lr = update_cosine_warmup_lr(it, sae_cfg.optimizer, optimizer, total_steps)
+            # Loss computation
+            optimizer.zero_grad(set_to_none=True) # Set gradients to None
+            with torch.amp.autocast(device_type='cuda' if 'cuda' in device else 'cpu', dtype=dt): # Mixed precision
 
-        # Get activations from input data
-        inputs = move_to_device([sequences], device)
+                # Get activations
+                activations = [] # Reset activations
+                with torch.no_grad():
+                    base_model(inputs)
+                    activations = activations[0][inputs > 2] # Pull out relevant tokens
+                    activations *= acts_scaling # Scale activations to 1/D variance
 
-        # Loss computation
-        optimizer.zero_grad(set_to_none=True) # Set gradients to None
-        with torch.amp.autocast(device_type='cuda' if 'cuda' in device else 'cpu', dtype=dt): # Mixed precision
+                # Get SAE output
+                pred_activations, latent_code = sae(activations, return_hidden=True) 
 
-            # Get activations
-            activations = [] # Reset activations
-            with torch.no_grad():
-                base_model(inputs)
-                activations = activations[0][inputs > 2] # Pull out relevant tokens
-                activations *= acts_scaling # Scale activations to 1/D variance
+                ## Regularization loss
+                # ReLU: L1 
+                if sae.sae_type == 'relu':
+                    loss_reg = torch.norm(latent_code, p=1, dim=-1).mean()
 
-            # Get SAE output
-            pred_activations, latent_code = sae(activations, return_hidden=True) 
+                # Sparsemax: Distance based penalty
+                elif sae.sae_type == 'sparsemax_dist':
 
-            ## Regularization loss
-            # ReLU: L1 
-            if sae.sae_type == 'relu':
-                loss_reg = torch.norm(latent_code, p=1, dim=-1).mean()
-
-            # Sparsemax: Distance based penalty
-            elif sae.sae_type == 'sparsemax_dist':
-
-                if encoder_reg: # distance based regularizer uses encoder weights
-                    dist_penalty_encoder = (
-                        activations.unsqueeze(1) - sae.Ae.unsqueeze(0)
-                        ).pow(2).sum(dim=-1)
+                    # Optimized using kernel trick: ||x - a||^2 = ||x||^2 + ||a||^2 - 2*x^T*a
+                    act_norm_sq = torch.sum(activations**2, dim=-1, keepdim=True)  # (batch_size, 1)
+                    ae_norm_sq = torch.sum(sae.Ae**2, dim=-1, keepdim=True).T  # (1, width)
+                    dot_product = torch.matmul(activations, sae.Ae.T)  # (batch_size, width)
+                    dist_penalty_encoder = act_norm_sq + ae_norm_sq - 2 * dot_product
                     loss_reg = (dist_penalty_encoder * latent_code).sum(dim=-1).mean()
 
-                else: # use decoder weights in dist-based regularizer
-                    dist_penalty = (
-                        activations.unsqueeze(1) - sae.Ad.T.unsqueeze(0)
-                        ).pow(2).sum(dim=-1)
-                    loss_reg = (dist_penalty * latent_code).sum(dim=-1).mean()
+                # JumpReLU: L0 loss
+                elif sae.sae_type == 'jumprelu':
+                    bandwidth = 1e-3
+                    loss_reg = torch.sum(
+                        step_fn(latent_code, torch.exp(sae.logthreshold), bandwidth), 
+                        dim=-1).mean()
 
-            # JumpReLU: L0 loss
-            elif sae.sae_type == 'jumprelu':
-                bandwidth = 1e-3
-                loss_reg = torch.mean(torch.sum(
-                    step_fn(latent_code, torch.exp(sae.logthreshold), bandwidth), 
-                    dim=-1))
+                # TopK: L0 loss
+                elif sae.sae_type == 'topk':
+                    loss_reg = torch.tensor([0.0], device=device)
 
-            # TopK: L0 loss
-            elif sae.sae_type == 'topk':
-                loss_reg = torch.tensor([0.0], device=device)
+                # MP: L0 loss
+                elif 'MP' in sae.sae_type:
+                    loss_reg = torch.tensor([0.0], device=device)
 
-            # MP: L0 loss
-            elif 'MP' in sae.sae_type:
-                loss_reg = torch.tensor([0.0], device=device)
+                else:
+                    raise ValueError('Invalid SAE type')
 
-            else:
-                raise ValueError('Invalid SAE type')
+                ## MSE
+                loss_mse = F.mse_loss(
+                    pred_activations, 
+                    activations, 
+                    reduction='sum'
+                ) / activations.shape[0]
 
-            ## MSE
-            loss_mse = F.mse_loss(
-                pred_activations, 
-                activations, 
-                reduction='sum'
-            ) / activations.shape[0]
+                ## Total loss
+                loss = loss_mse + gamma_reg * loss_reg
 
-            ## Total loss
-            loss = loss_mse + gamma_reg * loss_reg
+                ## Update model
+                loss.backward() # Compute gradients
+                if sae_cfg.optimizer.grad_clip > 0.0: # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(sae.parameters(), sae_cfg.optimizer.grad_clip)
+                optimizer.step() # Update weights
 
-            ## Update model
-            loss.backward() # Compute gradients
-            if sae_cfg.optimizer.grad_clip > 0.0: # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(sae.parameters(), sae_cfg.optimizer.grad_clip)
-            optimizer.step() # Update weights
-
-            ## Normalize weights
-            if normalize_weights:
+                ## Logging
                 with torch.no_grad():
-                    # Normalize encoder weights
-                    sae.Ae.data /= (sae.eps + torch.linalg.norm(sae.Ae.data, dim=1, keepdim=True)) 
-                    sae.Ae.data *= base_model.config.hidden_size ** 0.5
-                    
-                    # Normalize decoder weights (MP doesn't have an explicit decoder)
-                    if not 'MP' in sae.sae_type:
-                        sae.Ad.data /= (sae.eps + torch.linalg.norm(sae.Ad.data, dim=0, keepdim=True))
-                        sae.Ad.data *= base_model.config.hidden_size ** 0.5
+                    # Log MSE / variance explained
+                    av_norm_activations = activations.norm(dim=-1).pow(2).mean().item()
+                    train_log['total'].append(loss.item()) # Total loss
+                    train_log['mse'].append(loss_mse.item()) # MSE loss
+                    train_log['nmse'].append(loss_mse.item() / av_norm_activations) # Normalized MSE loss
+                    train_log['reg'].append(loss_reg.item()) # Reg loss
+                    train_log['variance_explained'].append((1 - (pred_activations - activations).var() / activations.var()).item())
+                    p_sparsity = (
+                        (latent_code.abs() < 1e-5).sum()
+                        / latent_code.numel() * 100
+                    )  # Sparsity of the latent code
+                    train_log["p_sparsity"].append(p_sparsity.item())  # Sparsity
+                    train_log['lambda'].append(sae.lambda_val.data.item()) # Lambda
+            
+                    if dev_dataloader is not None and sae_cfg.data.run_validation:
+                        with torch.no_grad():
+                            torch.cuda.empty_cache()
+                            for sequences, _, _ in dev_dataloader:
+                                activations = [] # Reset activations
+                                inputs = move_to_device([sequences], device)
+                                base_model(inputs)
+                                activations = activations[0][inputs > 2]
+                                activations *= acts_scaling # Scale activations to 1/D variance
+                                pred_activations, _ = sae(activations, return_hidden=True)
+                                loss_mse = F.mse_loss(
+                                    pred_activations, 
+                                    activations, 
+                                    reduction='sum'
+                                ) / activations.shape[0]
+                                av_norm_activations = activations.norm(dim=-1).pow(2).mean().item() 
+                                val_log['mse'].append(loss_mse.item()) # MSE loss
+                                val_log['nmse'].append(loss_mse.item() / av_norm_activations) # Normalized MSE loss
+                                val_log['variance_explained'].append((1 - (pred_activations - activations).var() / activations.var()).item())
+                                break # Only use one batch for validation
 
-            ## Logging
-            train_log['total'].append(loss.item()) # Total loss
-            train_log['mse'].append(loss_mse.item()) # MSE loss
-            train_log['reg'].append(loss_reg.item()) # Reg loss
-            p_sparsity = (latent_code.abs() < 1e-5).sum() / latent_code.numel()
-            train_log['p_sparsity'].append(p_sparsity.item()) # Sparsity
-            train_log['lambda'].append(sae.lambda_val.data.item())
+            # Log train metrics
+            if it % sae_cfg.log.log_interval == 0:
+                train_log = log_sae_train(it, sae_cfg.deploy, lr, train_log)
+                # print(val_log)
 
-        # Save model every few iterations
-        if it % sae_cfg.log.save_interval == 0:
-            save_sae(sae_cfg, sae, optimizer, it)
+            # Save model every few iterations
+            if it % sae_cfg.log.save_interval == 0:
+                save_sae(sae_cfg, sae, optimizer, it)
     
     # Save one last time
     save_sae(sae_cfg, sae, optimizer, it)
@@ -323,13 +340,4 @@ def train(sae_cfg, sae, base_model, base_model_tok, dataloader, optimizer, devic
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config-name", "-c", type=str, default="conf.yaml")
-    args = parser.parse_args()
-
-    with open(f"./config/sae_train/{args.config_name}", 'r') as handle:
-        sae_cfg = yaml.safe_load(handle)
-
-    sae_cfg = Box(sae_cfg)
-
-    main_hf(sae_cfg)
+    main_hf()

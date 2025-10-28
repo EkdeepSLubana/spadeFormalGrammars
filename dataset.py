@@ -1,6 +1,7 @@
 import json
+from typing import Any
 from dataclasses import dataclass
-from nnsight.envoy import Envoy
+# from nnsight.envoy import Envoy
 
 values_ordered = ["tense-present", "tense-past",
                   "voice-active", "voice-passive",
@@ -50,7 +51,7 @@ class Dataset:
 @dataclass(frozen=True)
 class Submodule:
     name: str
-    submodule: Envoy
+    submodule: Any
     use_input: bool = False
     is_tuple: bool = False
 

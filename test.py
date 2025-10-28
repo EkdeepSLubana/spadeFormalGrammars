@@ -5,7 +5,7 @@ sys.path.append("../dictionary_learning/")
 
 from collections import namedtuple
 from dictionary_learning import AutoEncoder, JumpReluAutoEncoder
-from sae import SAE, step_fn
+# from sae_test import SAE, step_fn
 from utils.loading import load_sae_inference_only
 
 # RelaxedArchetypalAutoEncoder
@@ -27,7 +27,8 @@ import argparse
 sns.set()
 sns.set_style("whitegrid")
 
-DICT_DIR = os.path.dirname(os.path.abspath(__file__)) + "/dictionaries"
+# DICT_DIR = os.path.dirname(os.path.abspath(__file__)) + "/dictionaries"
+DICT_DIR = "dictionaries"
 
 DictionaryStash = namedtuple("DictionaryStash", ["embed", "attns", "mlps", "resids"])
 
@@ -275,15 +276,22 @@ def get_activations(model, submodule, dictionary, batch, sae_path, identity=Fals
         x = submodule.get_activation()
         x_saved = x.save()
     x_saved = x_saved.value
+    orig_shape = x_saved.shape
     if "sparsemax_dist" in sae_path or "MP" in sae_path:
-        x_saved = x_saved[0]
+        x_saved = x_saved.flatten(start_dim=0, end_dim=1)
+        # x_saved = x_saved * (1 / 236.184564)
+        x_saved = x_saved * (1 / 64)
     if not identity:
-        # x_hat, f = dictionary(x_saved, return_hidden=True)
-        x_hat, f = dictionary(x_saved, output_features=True)
+        x_hat, f = dictionary(x_saved, return_hidden=True)
+        # x_hat, f = dictionary(x_saved, output_features=True)
     else:
         f = dictionary(x_saved)
         x_hat = f
-    # f_saved = f.save()
+    
+    if "sparsemax_dist" in sae_path or "MP" in sae_path:
+        f = f.view(orig_shape[0], orig_shape[1], -1)
+        x_hat = x_hat.view(orig_shape[0], orig_shape[1], -1)
+
     return (f.detach(), x_hat.detach())
 
 
@@ -512,16 +520,16 @@ if __name__ == "__main__":
     
     submodule = Submodule(
         name = f"resid_{mid_layer}",
-        # submodule=model.gpt_neox.layers[mid_layer],
-        submodule = model.model.layers[mid_layer],
+        submodule=model.gpt_neox.layers[mid_layer] if args.model_name == "pythia70m" else model.model.layers[mid_layer],
+        # submodule = model.model.layers[mid_layer],
         is_tuple=True,
     )
-    submodules, dictionaries = load_saes_and_submodules(model, dtype=dtype, device=device, thru_layer=mid_layer, neurons=neurons)
+    submodules, dictionaries = load_saes_and_submodules(model, dtype=dtype, device=device, thru_layer=mid_layer, neurons=True)
     submodule = get_mid_layer(submodules, mid_layer)
 
     # Load for inference only
-    # dictionary, _, _ = load_sae_inference_only(args.sae, dimin=model.config.hidden_size)
-    # dictionary.to("cuda:0")
+    dictionary, _, _ = load_sae_inference_only(args.sae, dimin=model.config.hidden_size)
+    dictionary.to("cuda:0")
     # dictionary.requires_grad_(False)
 
     # Archetypal SAEs
@@ -529,20 +537,20 @@ if __name__ == "__main__":
     #         "/home/aaron/fromgit/identifiable_language/archetypal/dictionary_learning/weights/pythia-70m/reg/trainer_0/ae.pt",
     #         device=device
     # )
+    # dictionary = dictionaries[submodule]
     if args.randomize_sae:
         dictionary._reset_parameters()
         # dictionaries[submodule].W_enc.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].W_dec.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].b_enc.data.normal_(mean=0, std=0.1)
         # dictionaries[submodule].b_dec.data.normal_(mean=0, std=0.1)
-    dictionary = dictionaries[submodule]
 
 
     dataset = load_dataset(args.dataset)
     examples = dataset.examples
     labels = dataset.labels_binary
     num_examples = len(examples)
-    batch_size = 1
+    batch_size = 16
 
     n_batches = math.ceil(num_examples / batch_size)
     batches = [
@@ -559,8 +567,8 @@ if __name__ == "__main__":
         x = submodule.get_activation()
         x_saved = x.save()
     if not args.identity_baseline:
-        # x_hat, f = dictionary(x_saved.value[:, 0, :], return_hidden=True)
-        x_hat, f = dictionary(x_saved.value[:, 0, :], output_features=True)
+        x_hat, f = dictionary(x_saved.value[:, 0, :], return_hidden=True)
+        # x_hat, f = dictionary(x_saved.value[:, 0, :], output_features=True)
     else:
         f = dictionary(x_saved.value[:, 0, :])
         x_hat = f
@@ -574,9 +582,6 @@ if __name__ == "__main__":
 
     for idx, batch in tqdm(enumerate(batches), desc="Caching activations", total=len(batches)):
         f, xhat = get_activations(model, submodule, dictionary, batch, args.sae, identity=args.identity_baseline)
-        if "sparsemax_dist" in args.sae or "MP" in args.sae:
-            f = f.unsqueeze(0)
-            xhat = xhat.unsqueeze(0)
         f = f.sum(dim=1)
         xhat = xhat.sum(dim=1)
         len_batch = len(batch)
@@ -594,15 +599,33 @@ if __name__ == "__main__":
                                                 lamda=args.lamda, metric=args.id_metric)
     if args.id_metric == "mcc":
         top_scores = scores.max(dim=0).values
-        # print(top_scores.shape)
-        # print(scores, top_features)
-        mcc = top_scores.mean().item()
+        
+        # Group scores by prefix (before hyphen)
+        prefix_groups = {}
         for i, label in enumerate(list(top_features.keys())):
-            if label not in ("domain-science", "sentiment-positive"):
+            prefix = label.split('-')[0] if '-' in label else label
+            if prefix not in prefix_groups:
+                prefix_groups[prefix] = []
+            prefix_groups[prefix].append(top_scores[i].item())
+        
+        # Compute average for each prefix group
+        prefix_averages = {}
+        for prefix, group_scores in prefix_groups.items():
+            prefix_averages[prefix] = sum(group_scores) / len(group_scores)
+        
+        # Compute macro-average across prefix groups
+        mcc = sum(prefix_averages.values()) / len(prefix_averages)
+        
+        # Print individual scores (for debugging)
+        for i, label in enumerate(list(top_features.keys())):
+            if label not in ("tense-past", "voice-passive"):
                 continue
             print(f"{label}: {top_scores[i]} ({top_features[label]})")
-        # for i, label in enumerate(list(top_features.keys())):
-        #     print(f"{label}: {top_scores[i]} ({top_features[label]})")
+        
+        # Print prefix averages
+        for prefix, avg in prefix_averages.items():
+            print(f"{prefix} average: {avg:.3f}")
+        
         print(f"MCC: {mcc:.3f}")
     else:
         print(scores)

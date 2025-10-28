@@ -70,7 +70,6 @@ def load_sae_inference_only(checkpoint_path, device='cpu', dimin=None):
         sae_type=config.sae.sae_type,
         kval_topk=config.sae.kval_topk if config.sae.sae_type=='topk' else None,
         mp_kval=config.sae.mp_kval if config.sae.sae_type=='MP' else None,
-        normalize_weights=True,
     )
     
     # Load state dict

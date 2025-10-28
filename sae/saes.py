@@ -2,12 +2,10 @@ import torch
 from sparsemax import Sparsemax
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
 import torch.nn.init as init
 
 class SAE(torch.nn.Module):
-    def __init__(self, dimin=2, width=5, sae_type='relu', kval_topk=None, mp_kval=None,
-                 normalize_weights=False, lambda_init = None):
+    def __init__(self, dimin=2, width=5, sae_type='relu', kval_topk=None, mp_kval=None, lambda_init = None):
         """
         dimin: (int)
             input dimension
@@ -17,15 +15,17 @@ class SAE(torch.nn.Module):
             one of 'relu', 'topk', 'jumprelu', 'sparsemax_lintx', 'sparsemax_dist'
         kval_topk: (int)
             k in topk sae_type
-        normalize_weights: (bool)
-            whether to normalize the decoder weights to unit norm
         """
         super(SAE, self).__init__()
         self.sae_type = sae_type
         self.width = width
         self.dimin = dimin
         self.eps = 0.01
-        self.normalize_weights = normalize_weights
+
+        ## Lambda parameter
+        lambda_init = 1/(4*dimin) if lambda_init is None else lambda_init
+        lambda_pre = softplus_inverse(lambda_init)
+        self.lambda_pre = nn.Parameter(lambda_pre, requires_grad=False) #not trainable
 
         ## Encoder parameters
         self.Ae = nn.Parameter(torch.randn((width, dimin))) #N(0,1) init
@@ -39,16 +39,6 @@ class SAE(torch.nn.Module):
             with torch.no_grad():
                 self.Ad.copy_(self.Ae.T) #at init, decoder is the transpose of encoder
 
-        ## Normalize the encoder and decoder weights, if desired
-        if normalize_weights:
-            print('\n\n==== Normalizing encoder / decoder weights ====\n\n')
-            with torch.no_grad():
-                Ae_unit = self.Ae / (self.eps + torch.linalg.norm(self.Ae, dim=1, keepdim=True))
-                self.Ae.copy_(Ae_unit)
-                if not 'MP' in sae_type:
-                    Ad_unit = self.Ad / (self.eps + torch.linalg.norm(self.Ad, dim=0, keepdim=True))
-                    self.Ad.copy_(Ad_unit)
-
         ## Parameters for specific SAEs
         # JumpReLU
         if sae_type=='jumprelu':
@@ -60,24 +50,23 @@ class SAE(torch.nn.Module):
             lambda_init = 1/(width*dimin) if lambda_init is None else lambda_init
             lambda_pre = softplus_inverse(lambda_init)
             self.lambda_pre = nn.Parameter(lambda_pre) #trainable parameter (~inv temp) for sparsemax
-        else:
-            lambda_init = 1/(4*dimin) if lambda_init is None else lambda_init
-            lambda_pre = softplus_inverse(lambda_init)
-            self.lambda_pre = nn.Parameter(lambda_pre, requires_grad=False) #not trainable
+
+            # Normalize the encoder and decoder weights
+            # if normalize_weights:
+            with torch.no_grad():
+                Ae_unit = self.Ae / (self.eps + torch.linalg.norm(self.Ae, dim=1, keepdim=True))
+                self.Ae.copy_(Ae_unit)
+                Ad_unit = self.Ad / (self.eps + torch.linalg.norm(self.Ad, dim=1, keepdim=True)) * 48.0
+                # Ad_unit = self.Ad / (self.eps + torch.linalg.norm(self.Ad, dim=1, keepdim=True)) * 22.6
+                self.Ad.copy_(Ad_unit)
         
         # Topk parameter
         if sae_type=='topk':
-            if kval_topk is not None:
-                self.kval_topk = kval_topk
-            else:
-                raise ValueError('kval_topk must be provided for topk sae_type')
+            self.kval_topk = kval_topk
 
         # MP parameter
         if sae_type=='MP':
-            if mp_kval is not None:
-                self.mp_kval = mp_kval
-            else:
-                raise ValueError('kval_topk must be provided for topk sae_type')
+            self.mp_kval = mp_kval
 
 
     @property
@@ -160,8 +149,12 @@ class SAE(torch.nn.Module):
             x = torch.matmul(codes, self.Ad.T) + self.bd
 
         elif self.sae_type=='sparsemax_dist':
-            # Encoder projection
-            x = -lam*torch.square(torch.norm(x.unsqueeze(1)-self.Ae.unsqueeze(0), dim=-1))
+            # Encoder projection - optimized using kernel trick
+            # ||x - a||^2 = ||x||^2 + ||a||^2 - 2*x^T*a
+            x_norm_sq = torch.sum(x**2, dim=-1, keepdim=True)  # (batch_size, 1)
+            ae_norm_sq = torch.sum(self.Ae**2, dim=-1, keepdim=True).T  # (1, width)
+            dot_product = torch.matmul(x, self.Ae.T)  # (batch_size, width)
+            x = -lam * (x_norm_sq + ae_norm_sq - 2*dot_product)
 
             # Sparse code: Sparsemax computation
             sm = Sparsemax(dim=-1)
@@ -202,12 +195,6 @@ class SAE(torch.nn.Module):
         init.zeros_(self.Ad)
         init.zeros_(self.be)
         init.zeros_(self.bd)
-
-        # decoder weights are initialized to random unit vectors
-        # dec_weight = torch.randn_like(self.Ad.weight)
-        # dec_weight = dec_weight / dec_weight.norm(dim=0, keepdim=True)
-        # self.Ad.weight = nn.Parameter(dec_weight)
-        # self.Ae.weight = nn.Parameter(dec_weight.clone().T)
 
 
 ######################## UTILS ########################
