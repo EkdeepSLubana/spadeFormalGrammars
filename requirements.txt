@@ -8,3 +8,4 @@ scikit_learn==1.6.1
 sparsemax==0.1.9
 torch==2.4.1
 tqdm==4.66.5
+wandb
