@@ -79,7 +79,6 @@ def init_wandb(cfg, project_name):
     if cfg.deploy:
         wandb.init(project=project_name)
         wandb.run.name = wandb.run.id
-        wandb.run.save()
         wandb.config.update(OmegaConf.to_container(cfg))
 
 
